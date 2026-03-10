@@ -69,7 +69,7 @@ get_qbit_port() {
 # Remove all iptables rules tagged with our comment
 clear_fw_rules() {
     local table chain pair
-    for pair in "nat:PREROUTING" "nat:POSTROUTING" "filter:FORWARD"; do
+    for pair in "nat:PREROUTING" "filter:FORWARD"; do
         table="${pair%%:*}"
         chain="${pair##*:}"
         while true; do
@@ -81,7 +81,9 @@ clear_fw_rules() {
     done
 }
 
-# Add DNAT + FORWARD + MASQUERADE rules for the assigned port
+# Add DNAT + FORWARD rules for the assigned port
+# No MASQUERADE — qBit's default route (via gateway) handles return traffic,
+# and preserving real peer IPs avoids qBit deduplicating all inbound as one peer.
 set_fw_rules() {
     local port="$1"
     clear_fw_rules
@@ -102,15 +104,7 @@ set_fw_rules() {
         -p udp --dport "$port" -j ACCEPT \
         -m comment --comment "$IPTABLES_COMMENT"
 
-    # MASQUERADE: so return traffic routes back through the gateway
-    iptables -t nat -I POSTROUTING -o "$VLAN_IFACE" -d "$QBIT_HOST" \
-        -p tcp --dport "$port" -j MASQUERADE \
-        -m comment --comment "$IPTABLES_COMMENT"
-    iptables -t nat -I POSTROUTING -o "$VLAN_IFACE" -d "$QBIT_HOST" \
-        -p udp --dport "$port" -j MASQUERADE \
-        -m comment --comment "$IPTABLES_COMMENT"
-
-    log "Firewall rules set for port $port (DNAT+FORWARD+MASQUERADE ${WG_IFACE}->${VLAN_IFACE})"
+    log "Firewall rules set for port $port (DNAT+FORWARD ${WG_IFACE}->${VLAN_IFACE})"
 }
 
 # Clean up firewall rules on exit
