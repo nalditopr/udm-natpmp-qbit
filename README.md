@@ -10,10 +10,11 @@ qBittorrent needs inbound connections for seeding, but it's behind a VPN. Proton
 
 A systemd service on the UDM that:
 
-1. Requests a NAT-PMP port from ProtonVPN every 45 seconds
-2. Sets iptables rules to forward that port to qBittorrent
+1. Requests a NAT-PMP port from ProtonVPN every 5 minutes (1-hour lease)
+2. Sets iptables DNAT+FORWARD rules to forward that port to qBittorrent
 3. Updates qBittorrent's listening port via the WebUI API
-4. Survives firmware updates via `/data/on_boot.d/` hook
+4. Re-syncs qBit's port if it restarts with a stale value
+5. Survives firmware updates via `/data/on_boot.d/` hook
 
 ```
 ProtonVPN (NAT-PMP server)
@@ -22,7 +23,7 @@ ProtonVPN (NAT-PMP server)
     |
 UDM Gateway ──── natpmp-qbit.service
     |               1. natpmpc requests port from VPN
-    |               2. iptables DNAT/FORWARD/MASQUERADE
+    |               2. iptables DNAT/FORWARD
     | VLAN bridge   3. curl updates qBit listening port
     |
 qBittorrent (VLAN IP)
@@ -74,18 +75,21 @@ qBittorrent (VLAN IP)
 
 ## How It Works
 
-- Every `REFRESH_INTERVAL` seconds (default 45), the script calls `natpmpc` to request a UDP+TCP port mapping with a `LEASE_TIME` second lease (default 60)
+- Every `REFRESH_INTERVAL` seconds (default 300), the script calls `natpmpc` to request a UDP+TCP port mapping with a `LEASE_TIME` second lease (default 3600)
 - When the assigned port changes, it:
   - Clears old iptables rules (tagged with `natpmp-qbit` comment)
-  - Adds DNAT, FORWARD, and MASQUERADE rules to route traffic from the WG tunnel to qBittorrent's VLAN IP
+  - Adds DNAT and FORWARD rules to route traffic from the WG tunnel to qBittorrent's VLAN IP
   - Logs into qBittorrent WebUI and updates the listening port
+- On every cycle (even if port is unchanged), verifies qBit's actual listening port matches the NAT-PMP port — catches pod/container restarts that reset to a stale port
 - If iptables rules disappear (Unifi rebuilds them on controller restart or UI changes), the script detects this and re-applies them automatically
+- No MASQUERADE — qBit's default route through the gateway handles return traffic, and preserving real peer source IPs prevents qBit from deduplicating all inbound connections as a single peer
 
 ## Resilience
 
 | Scenario | Handled? | How |
 |---|---|---|
 | Port changes | Yes | Detects new port, updates firewall + qBit |
+| qBit pod/container restart | Yes | Detects port mismatch, re-pushes correct port |
 | Unifi rebuilds iptables | Yes | Detects missing rules, re-applies next cycle |
 | Firmware updates | Yes | `/data/on_boot.d/` hook reinstalls the systemd unit |
 | VPN tunnel goes down | Yes | `natpmpc` fails gracefully, retries next cycle |
@@ -101,12 +105,50 @@ rm /data/on_boot.d/10-natpmp-qbit.sh
 systemctl daemon-reload
 ```
 
+## Gotchas
+
+- **Do NOT use MASQUERADE rules.** MASQUERADE rewrites inbound peer source IPs to the gateway IP, causing qBittorrent to see all peers as the same address. This breaks peer deduplication and limits swarm participation to effectively one connection
+- **Short lease times cause port churn.** A 60-second lease with ProtonVPN can cause the assigned port to change every few minutes, dropping all active peer connections each time. Use `LEASE_TIME=3600` (1 hour) to keep ports stable
+- **Disable UPnP/NAT-PMP in qBittorrent's settings.** The script handles port forwarding externally — qBit's built-in NAT-PMP would conflict and request a different mapping
+- **VPN reset = new port.** Restarting the WireGuard tunnel or switching VPN servers almost always assigns a new port. This is expected — the script picks it up on the next cycle
+- **qBit restart with stale port.** When qBittorrent restarts, it loads the last-saved listening port from config, which may not match the current NAT-PMP mapping. The script detects this mismatch every cycle and re-pushes the correct port (within `REFRESH_INTERVAL` seconds)
+- **NAS disk I/O bottleneck.** If qBit downloads stall or error after starting fast, the NAS may be choking on concurrent writes (especially USB-attached volumes). Reduce qBit's active downloads (2-3), I/O threads (2), and file pool size (20) in Advanced settings
+
 ## Troubleshooting
 
 - **NAT-PMP failures:** Check `journalctl -u natpmp-qbit`. Usually means the VPN tunnel is down or the VPN server changed
 - **Firewall rules missing:** `iptables -t nat -L PREROUTING -n | grep natpmp` — if empty, the script will auto-recover on the next cycle
 - **qBit port not updating:** Verify qBit is reachable: `curl -I http://<QBIT_HOST>:8080` from the UDM
 - **Service not starting after reboot:** Check that `/data/on_boot.d/10-natpmp-qbit.sh` exists and is executable
+- **All peers show same IP:** You have MASQUERADE rules active. Check `iptables -t nat -L POSTROUTING -n | grep natpmp` — if present, remove them. This script intentionally avoids MASQUERADE
+- **Port keeps changing (flapping):** Increase `LEASE_TIME` to 3600 and `REFRESH_INTERVAL` to 300. If it still flaps, the VPN server may be unstable — try a different ProtonVPN server
+- **Downloads stall after initial burst:** Check NAS/disk health. Run `dmesg | grep -i cifs` on the host — "stuck for 15 seconds" or "reconnect" messages indicate SMB mount timeouts. Reduce qBit concurrent writes (see Gotchas above)
+- **Port mismatch after qBit restart:** Wait up to `REFRESH_INTERVAL` seconds — the script auto-detects and corrects the mismatch. Check logs: `journalctl -u natpmp-qbit | grep mismatch`
+- **Verify end-to-end:** From the qBit host, confirm the listening port matches: `netstat -tlnp | grep qbittorrent`. From the UDM, confirm DNAT is set: `iptables -t nat -L PREROUTING -n | grep natpmp`
+
+## Recommended qBittorrent Settings
+
+These WebUI settings complement the NAT-PMP script for best performance:
+
+**Connection (Settings > Connection):**
+- UPnP / NAT-PMP: **Disabled** (the script handles this)
+- Global max connections: **300**
+- Per-torrent max connections: **50**
+
+**Speed (Settings > Speed):**
+- Global rate limits: **Unlimited** (let VPN be the bottleneck)
+- Apply rate to uTP: **No**
+- Apply rate to LAN peers: **No**
+
+**Downloads (Settings > Downloads):**
+- Max active downloads: **2-3** (prevents NAS disk saturation)
+- Max active uploads: **20**
+- Max active torrents: **25**
+
+**Advanced (Settings > Advanced):**
+- Disk I/O threads: **2** (reduces concurrent NAS writes)
+- File pool size: **20** (fewer open handles on NAS)
+- DHT, PeX, LSD: **Enabled** (more peer discovery)
 
 ## License
 
