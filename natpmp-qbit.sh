@@ -19,8 +19,8 @@ set -eu
 QBIT_PORT="${QBIT_PORT:-8080}"
 QBIT_USER="${QBIT_USER:-admin}"
 QBIT_PASS="${QBIT_PASS:-}"
-LEASE_TIME="${LEASE_TIME:-60}"
-REFRESH_INTERVAL="${REFRESH_INTERVAL:-45}"
+LEASE_TIME="${LEASE_TIME:-3600}"
+REFRESH_INTERVAL="${REFRESH_INTERVAL:-300}"
 
 # --- Internal state ---
 COOKIE_FILE="/tmp/qbt_cookies"
@@ -151,10 +151,20 @@ while true; do
         else
             log "ERROR: Failed to login to qBittorrent WebUI"
         fi
-    elif ! iptables -t nat -L PREROUTING -n 2>/dev/null | grep -q "$IPTABLES_COMMENT"; then
-        # Gateway may rebuild iptables (UI changes, controller restart) — re-apply
-        log "Firewall rules missing (gateway rebuild?), re-applying for port $PORT"
-        set_fw_rules "$PORT"
+    else
+        # Port unchanged — verify qBit and iptables are still in sync
+        if ! iptables -t nat -L PREROUTING -n 2>/dev/null | grep -q "$IPTABLES_COMMENT"; then
+            log "Firewall rules missing (gateway rebuild?), re-applying for port $PORT"
+            set_fw_rules "$PORT"
+        fi
+        # Re-push port to qBit if it restarted with a different listening port
+        if qbit_login; then
+            ACTUAL_PORT=$(get_qbit_port)
+            if [ -n "$ACTUAL_PORT" ] && [ "$ACTUAL_PORT" != "$PORT" ]; then
+                log "qBit port mismatch (has $ACTUAL_PORT, need $PORT) — re-setting"
+                set_qbit_port "$PORT"
+            fi
+        fi
     fi
 
     sleep "$REFRESH_INTERVAL"
