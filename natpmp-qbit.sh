@@ -19,16 +19,22 @@ set -eu
 QBIT_PORT="${QBIT_PORT:-8080}"
 QBIT_USER="${QBIT_USER:-admin}"
 QBIT_PASS="${QBIT_PASS:-}"
-LEASE_TIME="${LEASE_TIME:-3600}"
-REFRESH_INTERVAL="${REFRESH_INTERVAL:-300}"
+LEASE_TIME="${LEASE_TIME:-60}"
+REFRESH_INTERVAL="${REFRESH_INTERVAL:-45}"
 
 # --- Internal state ---
 COOKIE_FILE="/tmp/qbt_cookies"
 IPTABLES_COMMENT="natpmp-qbit"
-PREV_PORT=""
+PRIMARY_PORT=""    # qBit's listening port (set once, rarely changes)
+KNOWN_PORTS=""     # space-separated list of all ports seen from ProtonVPN
 LOGIN_TIME=0
 
 log() { logger -t natpmp-qbit "$*"; echo "$(date '+%Y-%m-%d %H:%M:%S') [natpmp] $*"; }
+
+is_known_port() {
+    case " $KNOWN_PORTS " in *" $1 "*) return 0 ;; esac
+    return 1
+}
 
 ensure_route() {
     if ! ip route get "$GATEWAY" 2>/dev/null | grep -q "$WG_IFACE"; then
@@ -81,30 +87,30 @@ clear_fw_rules() {
     done
 }
 
-# Add DNAT + FORWARD rules for the assigned port
+# Add DNAT + FORWARD rules for a single external port → qBit's primary port
 # No MASQUERADE — qBit's default route (via gateway) handles return traffic,
 # and preserving real peer IPs avoids qBit deduplicating all inbound as one peer.
-set_fw_rules() {
-    local port="$1"
-    clear_fw_rules
+# Rules accumulate (not cleared) so all known ports stay forwarded.
+add_fw_rules() {
+    local ext_port="$1" int_port="$2"
 
-    # DNAT: redirect incoming traffic on WG tunnel to qBittorrent
-    iptables -t nat -I PREROUTING -i "$WG_IFACE" -p tcp --dport "$port" \
-        -j DNAT --to-destination "${QBIT_HOST}:${port}" \
+    # DNAT: external port on WG tunnel → qBit's primary listening port
+    iptables -t nat -I PREROUTING -i "$WG_IFACE" -p tcp --dport "$ext_port" \
+        -j DNAT --to-destination "${QBIT_HOST}:${int_port}" \
         -m comment --comment "$IPTABLES_COMMENT"
-    iptables -t nat -I PREROUTING -i "$WG_IFACE" -p udp --dport "$port" \
-        -j DNAT --to-destination "${QBIT_HOST}:${port}" \
+    iptables -t nat -I PREROUTING -i "$WG_IFACE" -p udp --dport "$ext_port" \
+        -j DNAT --to-destination "${QBIT_HOST}:${int_port}" \
         -m comment --comment "$IPTABLES_COMMENT"
 
-    # FORWARD: allow WG -> VLAN
+    # FORWARD: allow WG -> VLAN (int_port since DNAT already translated)
     iptables -I FORWARD -i "$WG_IFACE" -o "$VLAN_IFACE" -d "$QBIT_HOST" \
-        -p tcp --dport "$port" -j ACCEPT \
+        -p tcp --dport "$int_port" -j ACCEPT \
         -m comment --comment "$IPTABLES_COMMENT"
     iptables -I FORWARD -i "$WG_IFACE" -o "$VLAN_IFACE" -d "$QBIT_HOST" \
-        -p udp --dport "$port" -j ACCEPT \
+        -p udp --dport "$int_port" -j ACCEPT \
         -m comment --comment "$IPTABLES_COMMENT"
 
-    log "Firewall rules set for port $port (DNAT+FORWARD ${WG_IFACE}->${VLAN_IFACE})"
+    log "Firewall rules added: external $ext_port -> qBit $int_port"
 }
 
 # Clean up firewall rules on exit
@@ -137,34 +143,38 @@ while true; do
         continue
     fi
 
-    if [ "$PORT" != "$PREV_PORT" ]; then
-        log "Port changed: ${PREV_PORT:-none} -> $PORT"
-        set_fw_rules "$PORT"
+    if [ -z "$PRIMARY_PORT" ]; then
+        # First port assignment — set qBit listening port and iptables
+        PRIMARY_PORT="$PORT"
+        KNOWN_PORTS="$PORT"
+        log "Primary port set: $PORT"
+        clear_fw_rules
+        add_fw_rules "$PORT" "$PORT"
         if qbit_login; then
-            if set_qbit_port "$PORT"; then
-                log "Updated qBittorrent listening port to $PORT"
-                PREV_PORT="$PORT"
-            else
-                log "ERROR: Failed to set qBittorrent port"
-                LOGIN_TIME=0
+            set_qbit_port "$PORT"
+            log "Updated qBittorrent listening port to $PORT"
+        fi
+    elif is_known_port "$PORT"; then
+        # Known port rotated back — iptables rules already exist, nothing to do
+        # Just verify fw rules and qBit port haven't been lost
+        if ! iptables -t nat -L PREROUTING -n 2>/dev/null | grep -q "$IPTABLES_COMMENT"; then
+            log "Firewall rules missing, re-adding all known ports"
+            for p in $KNOWN_PORTS; do
+                add_fw_rules "$p" "$PRIMARY_PORT"
+            done
+        fi
+        if qbit_login; then
+            ACTUAL=$(get_qbit_port)
+            if [ -n "$ACTUAL" ] && [ "$ACTUAL" != "$PRIMARY_PORT" ]; then
+                log "qBit port mismatch ($ACTUAL != $PRIMARY_PORT), fixing"
+                set_qbit_port "$PRIMARY_PORT"
             fi
-        else
-            log "ERROR: Failed to login to qBittorrent WebUI"
         fi
     else
-        # Port unchanged — verify qBit and iptables are still in sync
-        if ! iptables -t nat -L PREROUTING -n 2>/dev/null | grep -q "$IPTABLES_COMMENT"; then
-            log "Firewall rules missing (gateway rebuild?), re-applying for port $PORT"
-            set_fw_rules "$PORT"
-        fi
-        # Re-push port to qBit if it restarted with a different listening port
-        if qbit_login; then
-            ACTUAL_PORT=$(get_qbit_port)
-            if [ -n "$ACTUAL_PORT" ] && [ "$ACTUAL_PORT" != "$PORT" ]; then
-                log "qBit port mismatch (has $ACTUAL_PORT, need $PORT) — re-setting"
-                set_qbit_port "$PORT"
-            fi
-        fi
+        # Genuinely new port — add DNAT to primary port, don't touch qBit
+        log "New port discovered: $PORT (known: $KNOWN_PORTS)"
+        KNOWN_PORTS="$KNOWN_PORTS $PORT"
+        add_fw_rules "$PORT" "$PRIMARY_PORT"
     fi
 
     sleep "$REFRESH_INTERVAL"

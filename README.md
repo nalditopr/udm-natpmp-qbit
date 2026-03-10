@@ -10,11 +10,12 @@ qBittorrent needs inbound connections for seeding, but it's behind a VPN. Proton
 
 A systemd service on the UDM that:
 
-1. Requests a NAT-PMP port from ProtonVPN every 5 minutes (1-hour lease)
+1. Requests a NAT-PMP port from ProtonVPN every 45 seconds (60-second lease)
 2. Sets iptables DNAT+FORWARD rules to forward that port to qBittorrent
-3. Updates qBittorrent's listening port via the WebUI API
-4. Re-syncs qBit's port if it restarts with a stale value
-5. Survives firmware updates via `/data/on_boot.d/` hook
+3. Locks qBittorrent's listening port to the first assigned port (stable primary port)
+4. Accumulates firewall rules for all port rotations — all map to the primary port
+5. Re-syncs qBit's port if it restarts with a stale value
+6. Survives firmware updates via `/data/on_boot.d/` hook
 
 ```
 ProtonVPN (NAT-PMP server)
@@ -75,20 +76,18 @@ qBittorrent (VLAN IP)
 
 ## How It Works
 
-- Every `REFRESH_INTERVAL` seconds (default 300), the script calls `natpmpc` to request a UDP+TCP port mapping with a `LEASE_TIME` second lease (default 3600)
-- When the assigned port changes, it:
-  - Clears old iptables rules (tagged with `natpmp-qbit` comment)
-  - Adds DNAT and FORWARD rules to route traffic from the WG tunnel to qBittorrent's VLAN IP
-  - Logs into qBittorrent WebUI and updates the listening port
-- On every cycle (even if port is unchanged), verifies qBit's actual listening port matches the NAT-PMP port — catches pod/container restarts that reset to a stale port
-- If iptables rules disappear (Unifi rebuilds them on controller restart or UI changes), the script detects this and re-applies them automatically
+- Every `REFRESH_INTERVAL` seconds (default 45), the script calls `natpmpc` to request a UDP+TCP port mapping with a `LEASE_TIME` second lease (default 60)
+- On the **first port assignment**, it sets the **primary port** — this becomes qBittorrent's stable listening port for the session
+- When ProtonVPN rotates the external port (common with short leases), the script **accumulates** DNAT rules: all rotated ports forward to the primary port. qBit's listening port never changes
+- On every cycle, verifies qBit's actual listening port matches the primary port — catches pod/container restarts that reset to a stale value
+- If iptables rules disappear (Unifi rebuilds them on controller restart or UI changes), the script detects this and re-applies rules for **all known ports**
 - No MASQUERADE — qBit's default route through the gateway handles return traffic, and preserving real peer source IPs prevents qBit from deduplicating all inbound connections as a single peer
 
 ## Resilience
 
 | Scenario | Handled? | How |
 |---|---|---|
-| Port changes | Yes | Detects new port, updates firewall + qBit |
+| Port changes | Yes | Adds new DNAT rules mapping to primary port (accumulates, doesn't replace) |
 | qBit pod/container restart | Yes | Detects port mismatch, re-pushes correct port |
 | Unifi rebuilds iptables | Yes | Detects missing rules, re-applies next cycle |
 | Firmware updates | Yes | `/data/on_boot.d/` hook reinstalls the systemd unit |
@@ -108,7 +107,8 @@ systemctl daemon-reload
 ## Gotchas
 
 - **Do NOT use MASQUERADE rules.** MASQUERADE rewrites inbound peer source IPs to the gateway IP, causing qBittorrent to see all peers as the same address. This breaks peer deduplication and limits swarm participation to effectively one connection
-- **Short lease times cause port churn.** A 60-second lease with ProtonVPN can cause the assigned port to change every few minutes, dropping all active peer connections each time. Use `LEASE_TIME=3600` (1 hour) to keep ports stable
+- **Don't kill iptables rules while peers are connected.** Clearing firewall rules (e.g. `clear_fw_rules` or `iptables -F`) kills all existing connections immediately. A port change alone does NOT drop established connections — BitTorrent connections are long-lived and survive port rotation as long as the DNAT rules stay in place. The script accumulates rules for this reason
+- **Short leases are fine with port accumulation.** ProtonVPN's 60-second leases cause frequent port rotation, but the script accumulates DNAT rules for every port seen. All rotated ports forward to the stable primary port, so peers connecting on any previously-assigned port still reach qBit
 - **Disable UPnP/NAT-PMP in qBittorrent's settings.** The script handles port forwarding externally — qBit's built-in NAT-PMP would conflict and request a different mapping
 - **VPN reset = new port.** Restarting the WireGuard tunnel or switching VPN servers almost always assigns a new port. This is expected — the script picks it up on the next cycle
 - **qBit restart with stale port.** When qBittorrent restarts, it loads the last-saved listening port from config, which may not match the current NAT-PMP mapping. The script detects this mismatch every cycle and re-pushes the correct port (within `REFRESH_INTERVAL` seconds)
@@ -121,7 +121,7 @@ systemctl daemon-reload
 - **qBit port not updating:** Verify qBit is reachable: `curl -I http://<QBIT_HOST>:8080` from the UDM
 - **Service not starting after reboot:** Check that `/data/on_boot.d/10-natpmp-qbit.sh` exists and is executable
 - **All peers show same IP:** You have MASQUERADE rules active. Check `iptables -t nat -L POSTROUTING -n | grep natpmp` — if present, remove them. This script intentionally avoids MASQUERADE
-- **Port keeps changing (flapping):** Increase `LEASE_TIME` to 3600 and `REFRESH_INTERVAL` to 300. If it still flaps, the VPN server may be unstable — try a different ProtonVPN server
+- **Port keeps changing (flapping):** This is normal with short leases — the script handles it by accumulating DNAT rules. All rotated ports forward to the primary port. If qBit shows a different port than expected, wait one cycle for auto-correction
 - **Downloads stall after initial burst:** Check NAS/disk health. Run `dmesg | grep -i cifs` on the host — "stuck for 15 seconds" or "reconnect" messages indicate SMB mount timeouts. Reduce qBit concurrent writes (see Gotchas above)
 - **Port mismatch after qBit restart:** Wait up to `REFRESH_INTERVAL` seconds — the script auto-detects and corrects the mismatch. Check logs: `journalctl -u natpmp-qbit | grep mismatch`
 - **Verify end-to-end:** From the qBit host, confirm the listening port matches: `netstat -tlnp | grep qbittorrent`. From the UDM, confirm DNAT is set: `iptables -t nat -L PREROUTING -n | grep natpmp`
