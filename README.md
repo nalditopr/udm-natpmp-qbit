@@ -113,6 +113,7 @@ systemctl daemon-reload
 - **VPN reset = new port.** Restarting the WireGuard tunnel or switching VPN servers almost always assigns a new port. This is expected — the script picks it up on the next cycle
 - **qBit restart with stale port.** When qBittorrent restarts, it loads the last-saved listening port from config, which may not match the current NAT-PMP mapping. The script detects this mismatch every cycle and re-pushes the correct port (within `REFRESH_INTERVAL` seconds)
 - **NAS disk I/O bottleneck.** If qBit downloads stall or error after starting fast, the NAS may be choking on concurrent writes (especially USB-attached volumes). Reduce qBit's active downloads (2-3), I/O threads (2), and file pool size (20) in Advanced settings
+- **Docker Container** If you run qBit in docker use "network_mode: host" that way the container has access to all ports so when qbit changes port it works automatically.
 
 ## Troubleshooting
 
