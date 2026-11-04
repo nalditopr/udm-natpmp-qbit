@@ -51,20 +51,20 @@ qbit_login() {
         return 0
     fi
 
-    # Notera: Vi tar bort -f här för att faktiskt kunna fånga upp texten från qBit om det blir fel (t.ex. "Fails")
+    # note: Remove -f hto catch fails
     result=$(curl -s -c "$COOKIE_FILE" \
         -H "Referer: http://${QBIT_HOST}:${QBIT_PORT}" \
         "http://${QBIT_HOST}:${QBIT_PORT}/api/v2/auth/login" \
         --data-urlencode "username=${QBIT_USER}" \
         --data-urlencode "password=${QBIT_PASS}" 2>&1)
     
-    # Tvätta bort eventuella radbrytningar och mellanslag för en säkrare jämförelse
+    # Wash the result from newlines and empty spaces.
     local clean_result
     clean_result=$(echo "$result" | xargs)
 
     case "$clean_result" in
         Ok*|ok*|"") 
-            # Godkänn Ok, ok eller helt tomt svar
+            # accept Ok, ok or empty respons
             LOGIN_TIME=$now
             return 0 
             ;;
