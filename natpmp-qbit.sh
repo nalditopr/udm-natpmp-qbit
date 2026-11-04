@@ -50,12 +50,28 @@ qbit_login() {
     if [ $((now - LOGIN_TIME)) -lt 300 ] && [ -f "$COOKIE_FILE" ]; then
         return 0
     fi
-    result=$(curl -sf -c "$COOKIE_FILE" \
+
+    # Notera: Vi tar bort -f här för att faktiskt kunna fånga upp texten från qBit om det blir fel (t.ex. "Fails")
+    result=$(curl -s -c "$COOKIE_FILE" \
+        -H "Referer: http://${QBIT_HOST}:${QBIT_PORT}" \
         "http://${QBIT_HOST}:${QBIT_PORT}/api/v2/auth/login" \
-        -d "username=${QBIT_USER}&password=${QBIT_PASS}" 2>&1) || return 1
-    case "$result" in
-        Ok*|ok*) LOGIN_TIME=$now; return 0 ;;
-        *) log "Login response: $result"; return 1 ;;
+        --data-urlencode "username=${QBIT_USER}" \
+        --data-urlencode "password=${QBIT_PASS}" 2>&1)
+    
+    # Tvätta bort eventuella radbrytningar och mellanslag för en säkrare jämförelse
+    local clean_result
+    clean_result=$(echo "$result" | xargs)
+
+    case "$clean_result" in
+        Ok*|ok*|"") 
+            # Godkänn Ok, ok eller helt tomt svar
+            LOGIN_TIME=$now
+            return 0 
+            ;;
+        *) 
+            log "Login failed. Response: $result"
+            return 1 
+            ;;
     esac
 }
 
