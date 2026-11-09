@@ -51,20 +51,20 @@ qbit_login() {
         return 0
     fi
 
-    # note: Remove -f hto catch fails
+    # Notera: Vi tar bort -f här för att faktiskt kunna fånga upp texten från qBit om det blir fel (t.ex. "Fails")
     result=$(curl -s -c "$COOKIE_FILE" \
         -H "Referer: http://${QBIT_HOST}:${QBIT_PORT}" \
         "http://${QBIT_HOST}:${QBIT_PORT}/api/v2/auth/login" \
         --data-urlencode "username=${QBIT_USER}" \
         --data-urlencode "password=${QBIT_PASS}" 2>&1)
     
-    # Wash the result from newlines and empty spaces.
+    # Tvätta bort eventuella radbrytningar och mellanslag för en säkrare jämförelse
     local clean_result
     clean_result=$(echo "$result" | xargs)
 
     case "$clean_result" in
         Ok*|ok*|"") 
-            # accept Ok, ok or empty respons
+            # Godkänn Ok, ok eller helt tomt svar
             LOGIN_TIME=$now
             return 0 
             ;;
@@ -129,6 +129,24 @@ add_fw_rules() {
     log "Firewall rules added: external $ext_port -> qBit $int_port"
 }
 
+# Ensure natpmpc is installed, install it via apt if missing
+ensure_natpmpc() {
+    if command -v natpmpc >/dev/null 2>&1; then
+        return 0
+    fi
+
+    log "natpmpc not found, installing natpmp-utils"
+    if apt update && apt install -y natpmp-utils; then
+        if command -v natpmpc >/dev/null 2>&1; then
+            log "natpmp-utils installed successfully"
+            return 0
+        fi
+    fi
+
+    log "ERROR: Failed to install natpmp-utils, natpmpc is unavailable"
+    return 1
+}
+
 # Clean up firewall rules on exit
 cleanup() {
     log "Stopping — clearing firewall rules"
@@ -136,6 +154,8 @@ cleanup() {
     exit 0
 }
 trap cleanup INT TERM
+
+ensure_natpmpc || exit 1
 
 log "Starting NAT-PMP port forwarding (gateway=$GATEWAY, qbit=$QBIT_HOST:$QBIT_PORT)"
 
