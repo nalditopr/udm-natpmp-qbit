@@ -130,20 +130,25 @@ add_fw_rules() {
 }
 
 # Ensure natpmpc is installed, install it via apt if missing
+# Package is "natpmpc" on current Debian (bullseye+); very old releases used "natpmp-utils"
 ensure_natpmpc() {
+    local pkg
     if command -v natpmpc >/dev/null 2>&1; then
         return 0
     fi
 
-    log "natpmpc not found, installing natpmp-utils"
-    if apt update && apt install -y natpmp-utils; then
-        if command -v natpmpc >/dev/null 2>&1; then
-            log "natpmp-utils installed successfully"
+    log "natpmpc not found, installing"
+    apt update || log "WARNING: apt update failed, trying install anyway"
+
+    for pkg in natpmpc natpmp-utils; do
+        if apt install -y "$pkg" && command -v natpmpc >/dev/null 2>&1; then
+            log "$pkg installed successfully"
             return 0
         fi
-    fi
+        log "Installing $pkg failed"
+    done
 
-    log "ERROR: Failed to install natpmp-utils, natpmpc is unavailable"
+    log "ERROR: Could not install natpmpc"
     return 1
 }
 
