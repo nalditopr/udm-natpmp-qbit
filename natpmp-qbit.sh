@@ -28,6 +28,8 @@ IPTABLES_COMMENT="natpmp-qbit"
 PRIMARY_PORT=""    # qBit's listening port (set once, rarely changes)
 KNOWN_PORTS=""     # space-separated list of all ports seen from ProtonVPN
 LOGIN_TIME=0
+FAIL_COUNT=0      # consecutive failed NAT-PMP requests
+NATPMP_TIMEOUT="${NATPMP_TIMEOUT:-15}"  # seconds before natpmpc is killed
 
 log() { logger -t natpmp-qbit "$*"; echo "$(date '+%Y-%m-%d %H:%M:%S') [natpmp] $*"; }
 
@@ -52,7 +54,7 @@ qbit_login() {
     fi
 
     # Notera: Vi tar bort -f här för att faktiskt kunna fånga upp texten från qBit om det blir fel (t.ex. "Fails")
-    result=$(curl -s -c "$COOKIE_FILE" \
+    result=$(curl -s --connect-timeout 5 --max-time 10 -c "$COOKIE_FILE" \
         -H "Referer: http://${QBIT_HOST}:${QBIT_PORT}" \
         "http://${QBIT_HOST}:${QBIT_PORT}/api/v2/auth/login" \
         --data-urlencode "username=${QBIT_USER}" \
@@ -77,13 +79,13 @@ qbit_login() {
 
 set_qbit_port() {
     local port="$1"
-    curl -sf -b "$COOKIE_FILE" \
+    curl -sf --connect-timeout 5 --max-time 10 -b "$COOKIE_FILE" \
         "http://${QBIT_HOST}:${QBIT_PORT}/api/v2/app/setPreferences" \
         -d "json={\"listen_port\":${port}}" >/dev/null 2>&1
 }
 
 get_qbit_port() {
-    curl -sf -b "$COOKIE_FILE" \
+    curl -sf --connect-timeout 5 --max-time 10 -b "$COOKIE_FILE" \
         "http://${QBIT_HOST}:${QBIT_PORT}/api/v2/app/preferences" 2>/dev/null \
         | sed -n 's/.*"listen_port":\([0-9]*\).*/\1/p'
 }
@@ -169,19 +171,29 @@ while true; do
     ensure_route
 
     # Request NAT-PMP mappings (both UDP and TCP)
-    natpmpc -a 1 0 udp "$LEASE_TIME" -g "$GATEWAY" >/dev/null 2>&1 || true
-    TCP_OUT=$(natpmpc -a 1 0 tcp "$LEASE_TIME" -g "$GATEWAY" 2>&1) || {
-        log "ERROR: natpmpc TCP request failed"
+    # timeout prevents natpmpc from hanging forever if the gateway doesn't answer
+    timeout "$NATPMP_TIMEOUT" natpmpc -a 1 0 udp "$LEASE_TIME" -g "$GATEWAY" >/dev/null 2>&1 || true
+    TCP_RC=0
+    TCP_OUT=$(timeout "$NATPMP_TIMEOUT" natpmpc -a 1 0 tcp "$LEASE_TIME" -g "$GATEWAY" 2>&1) || TCP_RC=$?
+    if [ "$TCP_RC" -ne 0 ]; then
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        log "ERROR: natpmpc TCP request failed (rc=$TCP_RC, attempt $FAIL_COUNT): $(echo "$TCP_OUT" | tr '\n' ' ' | cut -c1-200)"
         sleep "$REFRESH_INTERVAL"
         continue
-    }
+    fi
 
     # Parse: "Mapped public port 58540 protocol TCP"
     PORT=$(echo "$TCP_OUT" | sed -n 's/.*Mapped public port \([0-9]*\).*/\1/p' | head -1)
     if [ -z "$PORT" ]; then
-        log "ERROR: Could not parse port from natpmpc output"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        log "ERROR: Could not parse port from natpmpc output (attempt $FAIL_COUNT): $(echo "$TCP_OUT" | tr '\n' ' ' | cut -c1-200)"
         sleep "$REFRESH_INTERVAL"
         continue
+    fi
+
+    if [ "$FAIL_COUNT" -gt 0 ]; then
+        log "NAT-PMP recovered after $FAIL_COUNT failed attempts (port $PORT)"
+        FAIL_COUNT=0
     fi
 
     if [ -z "$PRIMARY_PORT" ]; then
