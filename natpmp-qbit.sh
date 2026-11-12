@@ -230,5 +230,6 @@ while true; do
         add_fw_rules "$PORT" "$PRIMARY_PORT"
     fi
 
+    log "OK: NAT-PMP lease refreshed (public port $PORT -> qBit $PRIMARY_PORT, known ports: $KNOWN_PORTS)"
     sleep "$REFRESH_INTERVAL"
 done
